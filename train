@@ -1,0 +1,191 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import numpy as np
+from sklearn.metrics import accuracy_score, precision_score, f1_score
+from sklearn.model_selection import StratifiedKFold
+from Dataloader import ProteomicsDataset
+import pickle
+import random
+import os
+
+device = torch.device('cuda:1' if torch.cuda.is_available() else 'cpu')
+print(f'Using device: {device}')
+
+
+class SelfAttention(nn.Module):
+    def __init__(self, embed_dim, num_heads=8):
+        super(SelfAttention, self).__init__()
+        self.attention = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True)
+        self.layer_norm = nn.LayerNorm(embed_dim)
+
+    def forward(self, x):
+        attn_output, _ = self.attention(x, x, x)
+        return self.layer_norm(attn_output + x)
+
+
+class SimpleNNWithAttention(nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim, reduced_dim=2048, embed_dim=2048, num_heads=4):
+        super(SimpleNNWithAttention, self).__init__()
+        self.input_projection = nn.Linear(input_dim, reduced_dim)
+        self.self_attention = SelfAttention(embed_dim, num_heads)
+        self.fc1 = nn.Linear(embed_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, output_dim)
+        self.relu = nn.ReLU()
+        self.dropout = nn.Dropout(p=0.3)
+        self._initialize_weights()
+
+    def _initialize_weights(self):
+        nn.init.kaiming_uniform_(self.input_projection.weight, nonlinearity='relu')
+        nn.init.zeros_(self.input_projection.bias)
+        nn.init.kaiming_uniform_(self.fc1.weight, nonlinearity='relu')
+        nn.init.zeros_(self.fc1.bias)
+        nn.init.xavier_uniform_(self.fc2.weight)
+        nn.init.zeros_(self.fc2.bias)
+
+    def forward(self, x):
+        x = self.input_projection(x)
+        x = x.unsqueeze(1)
+        x = self.self_attention(x)
+        x = x.squeeze(1)
+        x = self.dropout(x)
+        x = self.relu(self.fc1(x))
+        return self.fc2(x)
+
+
+def compute_gradient_importance(model, X, y, criterion):
+    X = X.to(device)
+    y = y.to(device)
+    X.requires_grad_()
+    model.eval()
+    outputs = model(X)
+    loss = criterion(outputs, y)
+    model.zero_grad()
+    loss.backward()
+    return X.grad.abs().mean(dim=0).detach().cpu().numpy()
+
+
+def train_and_evaluate(train_idx, test_idx, dataset, input_dim, hidden_dim, num_epochs, lr):
+    train_subset = torch.utils.data.Subset(dataset, train_idx)
+    test_subset = torch.utils.data.Subset(dataset, test_idx)
+    train_loader = torch.utils.data.DataLoader(train_subset, batch_size=32, shuffle=True)
+    test_loader = torch.utils.data.DataLoader(test_subset, batch_size=32, shuffle=False)
+
+    model = SimpleNNWithAttention(input_dim, hidden_dim, output_dim=2).to(device)
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.Adagrad(model.parameters(), lr=lr)
+
+    best_acc = 0.0
+    best_state = None
+    for epoch in range(num_epochs):
+        model.train()
+        for data, labels in train_loader:
+            data, labels = data.to(device), labels.to(device)
+            optimizer.zero_grad()
+            loss = criterion(model(data), labels)
+            loss.backward()
+            optimizer.step()
+        acc = evaluate_model(model, test_loader)
+        if acc > best_acc:
+            best_acc = acc
+            best_state = model.state_dict()
+    model.load_state_dict(best_state)
+
+    # Evaluation
+    y_true, y_pred = [], []
+    model.eval()
+    with torch.no_grad():
+        for data, labels in test_loader:
+            data, labels = data.to(device), labels.to(device)
+            outputs = model(data)
+            preds = torch.argmax(outputs, dim=1)
+            y_true.extend(labels.cpu().numpy())
+            y_pred.extend(preds.cpu().numpy())
+    precision = precision_score(y_true, y_pred, average='binary')
+    f1 = f1_score(y_true, y_pred, average='binary')
+    return model, best_acc, precision, f1, test_loader
+
+
+def evaluate_model(model, data_loader):
+    model.eval()
+    all_labels, all_preds = [], []
+    with torch.no_grad():
+        for data, labels in data_loader:
+            data, labels = data.to(device), labels.to(device)
+            outputs = model(data)
+            _, preds = torch.max(outputs, 1)
+            all_labels.extend(labels.cpu().numpy())
+            all_preds.extend(preds.cpu().numpy())
+    return accuracy_score(all_labels, all_preds)
+
+
+def load_protein_dimensions(pickle_file):
+    with open(pickle_file, 'rb') as f:
+        return pickle.load(f)
+
+
+def set_seed(seed):
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def run_kfold_executions(num_runs, num_folds, output_file):
+    dataset_path = '/home/lixiaoyang/hello/data/data_all.csv'
+    dims_path = 'protein_dimensions.pkl'
+    protein_names = ['RAB6A', 'PAICS']
+    base_seed = 63
+
+    dataset = ProteomicsDataset(dataset_path)
+    labels = np.array([lbl for _, lbl in dataset])
+    protein_dims = load_protein_dimensions(dims_path)
+    prot_idx = {name: protein_dims[name] for name in protein_names if name in protein_dims}
+    input_dim = len(dataset.get_protein_dimensions()) - 1
+
+    with open(output_file, 'w') as f:
+        f.write("Run\tSeed\tFold\tAccuracy\tPrecision\tF1\tProtein\tGradient\tRank\n")
+
+    for run in range(1, num_runs + 1):
+        seed = base_seed + run
+        set_seed(seed)
+        skf = StratifiedKFold(n_splits=num_folds, shuffle=True, random_state=seed)
+
+        for fold, (train_idx, test_idx) in enumerate(skf.split(np.zeros(len(labels)), labels), 1):
+            print(f"Run {run}, Seed {seed}, Fold {fold}...")
+            model, acc, precision, f1, test_loader = train_and_evaluate(
+                train_idx, test_idx, dataset, input_dim,
+                hidden_dim=1024, num_epochs=10, lr=5e-3
+            )
+
+            # Save model at Fold 2
+            if fold == 3:
+                model_save_path = f"/home/lixiaoyang/hello/model_fold2_run{run}.pt"
+                torch.save(model.state_dict(), model_save_path)
+                print(f"Model from Run {run}, Fold 2 saved to {model_save_path}")
+
+            try:
+                X_batch, y_batch = next(iter(test_loader))
+            except StopIteration:
+                continue
+
+            grads = compute_gradient_importance(model, X_batch, y_batch, nn.CrossEntropyLoss())
+            sorted_idx = np.argsort(grads)[::-1]
+
+            with open(output_file, 'a') as f:
+                for pname, pidx in prot_idx.items():
+                    if pidx >= len(grads):
+                        continue
+                    gval = grads[pidx]
+                    rank = int(np.where(sorted_idx == pidx)[0][0]) + 1
+                    line = f"{run}\t{seed}\t{fold}\t{acc:.4f}\t{precision:.4f}\t{f1:.4f}\t{pname}\t{gval:.12f}\t{rank}\n"
+                    try:
+                        f.write(line)
+                        f.flush()
+                    except Exception as e:
+                        print(f"Error writing to file: {e}")
+
+
+if __name__ == "__main__":
+    run_kfold_executions(num_runs=1, num_folds=5, output_file='/home/lixiaoyang/hello/kfold_result.txt')
